@@ -7,7 +7,9 @@ import (
 	"strconv"
 	"testing"
 
+	"entgo.io/bug/ent/user"
 	"entgo.io/ent/dialect"
+	"entgo.io/ent/dialect/sql"
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/lib/pq"
 	_ "github.com/mattn/go-sqlite3"
@@ -56,9 +58,93 @@ func TestBugMaria(t *testing.T) {
 
 func test(t *testing.T, client *ent.Client) {
 	ctx := context.Background()
-	client.User.Delete().ExecX(ctx)
-	client.User.Create().SetName("Ariel").SetAge(30).ExecX(ctx)
-	if n := client.User.Query().CountX(ctx); n != 1 {
-		t.Errorf("unexpected number of users: %d", n)
-	}
+
+	t.Run("count over on join", func(t *testing.T) {
+		client.User.Delete().ExecX(ctx)
+
+		u1 := client.User.Create().SetName("Ariel").SaveX(ctx)
+		u2 := client.User.Create().SetName("Giàu").SaveX(ctx)
+		u3 := client.User.Create().SetName("Pedro").SaveX(ctx)
+
+		client.Post.Create().SetTitle("p1").AddUsers(u1).ExecX(ctx)
+
+		client.Post.Create().SetTitle("p2").AddUsers(u2).ExecX(ctx)
+		client.Post.Create().SetTitle("p3").AddUsers(u2).ExecX(ctx)
+
+		client.Post.Create().SetTitle("p4").AddUsers(u3).ExecX(ctx)
+		client.Post.Create().SetTitle("p5").AddUsers(u3).ExecX(ctx)
+		client.Post.Create().SetTitle("p6").AddUsers(u3).ExecX(ctx)
+
+		// query=SELECT DISTINCT `users`.`id`, `users`.`name` FROM `users` JOIN `post_users` AS `t1` ON `t1`.`user_id` = `users`.`id` ORDER BY COUNT(*) OVER(PARTITION BY user_id) args=[]
+		users := client.Debug().User.Query().Order(func(selector *sql.Selector) {
+			tb := sql.Table(user.PostsTable)
+			selector.Join(tb).On(tb.C("user_id"), selector.C(user.FieldID))
+			selector.OrderExpr(sql.Expr(sql.Count("*") + " OVER(PARTITION BY user_id)"))
+		}).AllX(ctx)
+
+		if users[0].ID != u3.ID && users[1].ID != u2.ID {
+			t.Fatalf("got wrong order: %#v", users)
+		}
+	})
+
+	t.Run("using raw subqueries", func(t *testing.T) {
+		client.User.Delete().ExecX(ctx)
+
+		u1 := client.User.Create().SetName("Ariel").SaveX(ctx)
+		u2 := client.User.Create().SetName("Giàu").SaveX(ctx)
+		u3 := client.User.Create().SetName("Pedro").SaveX(ctx)
+
+		client.Post.Create().SetTitle("p1").AddUsers(u1).ExecX(ctx)
+
+		client.Post.Create().SetTitle("p2").AddUsers(u2).ExecX(ctx)
+		client.Post.Create().SetTitle("p3").AddUsers(u2).ExecX(ctx)
+
+		client.Post.Create().SetTitle("p4").AddUsers(u3).ExecX(ctx)
+		client.Post.Create().SetTitle("p5").AddUsers(u3).ExecX(ctx)
+		client.Post.Create().SetTitle("p6").AddUsers(u3).ExecX(ctx)
+
+		// query=SELECT DISTINCT `users`.`id`, `users`.`name` FROM `users` ORDER BY (SELECT user_id FROM (SELECT user_id, count(user_id) FROM post_users GROUP BY user_id) q) DESC
+		users := client.Debug().User.Query().Order(func(selector *sql.Selector) {
+			selector.OrderExpr(sql.Expr(`
+(SELECT user_id FROM (SELECT user_id, count(user_id) FROM ` + user.PostsTable + ` GROUP BY user_id) q)
+DESC
+`))
+		}).AllX(ctx)
+
+		if users[0].ID != u3.ID && users[1].ID != u2.ID {
+			t.Fatalf("got wrong order: %#v", users)
+		}
+	})
+
+	t.Run("join subquery", func(t *testing.T) {
+		client.User.Delete().ExecX(ctx)
+
+		u1 := client.User.Create().SetName("Ariel").SaveX(ctx)
+		u2 := client.User.Create().SetName("Giàu").SaveX(ctx)
+		u3 := client.User.Create().SetName("Pedro").SaveX(ctx)
+
+		client.Post.Create().SetTitle("p1").AddUsers(u1).ExecX(ctx)
+
+		client.Post.Create().SetTitle("p2").AddUsers(u2).ExecX(ctx)
+		client.Post.Create().SetTitle("p3").AddUsers(u2).ExecX(ctx)
+
+		client.Post.Create().SetTitle("p4").AddUsers(u3).ExecX(ctx)
+		client.Post.Create().SetTitle("p5").AddUsers(u3).ExecX(ctx)
+		client.Post.Create().SetTitle("p6").AddUsers(u3).ExecX(ctx)
+
+		// query=SELECT DISTINCT `users`.`id`, `users`.`name` FROM `users` JOIN (SELECT `post_users`.`user_id`, COUNT(*) AS count FROM `post_users` GROUP BY `post_users`.`user_id`) AS `t1` ON `t1`.`user_id` = `users`.`id` ORDER BY `t1`.`count` args=[]
+		users := client.Debug().User.Query().Order(func(selector *sql.Selector) {
+			tb := sql.Table(user.PostsTable)
+			query := sql.Select(tb.C("user_id"), "COUNT(*) AS count").
+				From(tb).
+				GroupBy(tb.C("user_id"))
+
+			selector.Join(query).On(query.C("user_id"), selector.C(user.FieldID))
+			selector.OrderBy(query.C("count"))
+		}).AllX(ctx)
+
+		if users[0].ID != u3.ID && users[1].ID != u2.ID {
+			t.Fatalf("got wrong order: %#v", users)
+		}
+	})
 }
